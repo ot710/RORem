@@ -28,7 +28,7 @@
 ```
 git clone https://github.com/leeruibin/RORem.git
 cd RORem
-conda env create -n environment.yaml
+conda env create -f environment.yaml
 conda activate RORem
 ```
 
