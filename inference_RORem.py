@@ -1,10 +1,14 @@
 from diffusers import AutoPipelineForInpainting
+import numpy as np
+from PIL import Image, ImageFilter
 import torch
+import gc
 import os
 from diffusers import UNet2DConditionModel
 import argparse
 from myutils.img_util import dilate_mask
 from diffusers.utils import load_image
+import datetime
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -22,6 +26,24 @@ def parse_args():
         help="Path to pretrain RORem Unet",
     )
     parser.add_argument(
+        "--image_dir",
+        type=str,
+        default=None,
+        help="Path to the input images directory.",
+    )
+    parser.add_argument(
+        "--mask_dir",
+        type=str,
+        default=None,
+        help="Path to the mask images directory.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Path to the folder to save the removal results.",
+    )
+    parser.add_argument(
         "--image_path",
         type=str,
         default=None,
@@ -33,6 +55,13 @@ def parse_args():
         default=None,
         help="Path to the mask image.",
     )
+    # This is used to restore vessel pixels inside disc (doesn't work well for now)
+    # parser.add_argument(
+    #     "--vessel_mask_path",
+    #     type=str,
+    #     default=None,
+    #     help="Path to the vessel mask image.",
+    # )
     parser.add_argument(
         "--save_path",
         type=str,
@@ -56,6 +85,18 @@ def parse_args():
         help="dilate the mask"
     )
     parser.add_argument(
+        "--blur_radius",
+        default=0,
+        type=int,
+        help="apply box blur to the mask (radius of the square kernel)"
+    )
+    parser.add_argument(
+        "--blur_sd",
+        default=0,
+        type=int,
+        help="apply Gaussian blur to the mask (standard deviation of the Gaussian kernel)"
+    )
+    parser.add_argument(
         "--use_CFG",
         type=lambda x: x.lower() == 'true',
         default=True,
@@ -65,27 +106,26 @@ def parse_args():
 
     return args
 
-def main(args):
-
-    if args.pretrained_model is None:
-        pretrain_path = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
-    else:
-        pretrain_path = args.pretrained_model
+def load_pipeline(pretrain_path, checkpoint_path):
     # load pretrained SDXL-inpainting model
     pipe_edit = AutoPipelineForInpainting.from_pretrained(
         pretrain_path,
-        torch_dtype=torch.float16, 
+        torch_dtype=torch.float16,
     )
 
     # load RORem Unet
-    unet = UNet2DConditionModel.from_pretrained(args.RORem_unet).to("cuda",dtype=torch.float16)
-    print(f"Finish loading unet from {args.RORem_unet}!!")
-    pipe_edit.unet = unet
+    unet = UNet2DConditionModel.from_pretrained(checkpoint_path).to("cuda", dtype=torch.float16)
+    print(f"Finish loading unet from {checkpoint_path}!!")
 
+    pipe_edit.unet = unet
     pipe_edit.to("cuda")
 
+    # disable the progress bar
+    pipe_edit.set_progress_bar_config(disable=True)
 
+    return pipe_edit
 
+def process_single_image(args, pipe_edit):
     height = width = args.resolution
     image_name = args.image_path.split("/")[-1]
     if args.save_path is None:
@@ -95,40 +135,98 @@ def main(args):
     else:
         save_folder = os.path.dirname(args.save_path)
         os.makedirs(save_folder,exist_ok=True)
-    input_image = load_image(args.input_path).resize((args.resolution,args.resolution))
+    input_image = load_image(args.image_path).resize((args.resolution,args.resolution))
     input_mask = load_image(args.mask_path).resize((args.resolution,args.resolution))
+    # rescale mask image from 0-1 to 0-255
+    mask_np = np.array(input_mask) # convert to np array
+    mask_np = (mask_np > 0).astype(np.uint8) * 255 # scale
+    input_mask = Image.fromarray(mask_np) # convert back to PIL
+    if args.blur_radius != 0:
+        input_mask = input_mask.filter(ImageFilter.BoxBlur(radius=args.blur_radius))
+    elif args.blur_sd != 0:
+        input_mask = input_mask.filter(ImageFilter.GaussianBlur(radius=args.blur_sd))
     if args.dilate_size != 0:
-        mask_image = dilate_mask(mask_image,args.dilate_size)
+        input_mask = dilate_mask(input_mask,args.dilate_size)
     if not args.use_CFG:
         prompts = ""
-        Removal_result = pipe_edit(
-                prompt=prompts,
-                height=height,
-                width=width,
-                image=input_image,
-                mask_image=input_mask,
-                guidance_scale=1.,
-                num_inference_steps=50,  # steps between 15 and 30 also work well
-                strength=0.99,  # make sure to use `strength` below 1.0
-            ).images[0]
+        with torch.no_grad():
+            Removal_result = pipe_edit(
+                    prompt=prompts,
+                    height=height,
+                    width=width,
+                    image=input_image,
+                    mask_image=input_mask,
+                    guidance_scale=1.,
+                    num_inference_steps=50,  # steps between 15 and 30 also work well
+                    strength=0.99,  # make sure to use `strength` below 1.0
+                ).images[0]
     else:
-        # we also find by adding these prompt, the model can work even better
-        prompts = "4K, high quality, masterpiece, Highly detailed, Sharp focus, Professional, photorealistic, realistic"
-        negative_prompts = "low quality, worst, bad proportions, blurry, extra finger, Deformed, disfigured, unclear background"
-        Removal_result = pipe_edit(
-                prompt=prompts,
-                negative_prompt=negative_prompts,
-                height=height,
-                width=width,
-                image=input_image,
-                mask_image=input_mask,
-                guidance_scale=1.,
-                num_inference_steps=50,  # steps between 15 and 30 also work well
-                strength=0.99,  # make sure to use `strength` below 1.0
-            ).images[0]
+        # we also find by adding these prompts, the model can work even better
+        prompts = "smooth, 4K, high quality, masterpiece, Highly detailed, Sharp focus, Professional, photorealistic, realistic"
+        negative_prompts = "sharp edge, low quality, worst, bad proportions, extra finger, Deformed, disfigured, unclear background"
+        with torch.no_grad():
+            Removal_result = pipe_edit(
+                    prompt=prompts,
+                    negative_prompt=negative_prompts,
+                    height=height,
+                    width=width,
+                    image=input_image,
+                    mask_image=input_mask,
+                    guidance_scale=1.,
+                    num_inference_steps=30,  # steps between 15 and 30 also work well
+                    strength=0.3, # make sure to use `strength` below 1.0
+                ).images[0]
 
-    Removal_result.save(save_folder)
+    Removal_result.save(args.save_path)
+    # prevent memory accumulation
+    del input_image, input_mask, Removal_result
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # # Restore original vessel pixels (not used because of light contamination from disc)
+    # gen = np.array(Removal_result)
+    # orig = np.array(input_image)
+    # vessel_mask = load_image(args.vessel_mask_path).resize((args.resolution,args.resolution))
+    # vessel = np.array(vessel_mask.convert("L")) # ensure greyscale and not RGB
+    # vessel = (vessel > 0).astype(np.uint8) # binarize vessel mask
+    # final = orig * vessel[..., None] + gen * (1 - vessel[..., None]) # keep generated only where vessel==0
+    # final_image = Image.fromarray(final.astype(np.uint8)) # convert to PIL
+    # final_image.save(args.save_path)
+
+def main(args, pipe_edit):
+    if args.image_dir is not None:
+        image_paths = sorted([os.path.join(args.image_dir, f) for f in os.listdir(args.image_dir) if f.endswith('.png')])
+
+        for i, img_path in enumerate(image_paths):
+            step = max(1, len(image_paths) // 10) # print progress every 10%
+            if i % step == 0:
+                print(datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                print(f'[{i}/{len(image_paths)}] ({(i/len(image_paths))*100:.1f}%)')
+            filename = os.path.basename(img_path)
+            mask_path = os.path.join(args.mask_dir, filename)
+
+            if not os.path.exists(mask_path):
+                print(f'Skipping: {filename} (no mask found)')
+                continue
+
+            args.image_path = img_path
+            args.mask_path = mask_path
+            args.save_path = os.path.join(args.output_dir, filename)
+
+            if os.path.exists(args.save_path): # avoid rerunning already done images
+                continue
+
+            try:
+                process_single_image(args, pipe_edit)
+            except Exception as e:
+                print(f'Error on {filename}: {e}')
+                continue
+
+        return
+    
+    process_single_image(args, pipe_edit)
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    pipe_edit = load_pipeline(args.pretrained_model, args.RORem_unet)
+    main(args, pipe_edit)
